@@ -2,22 +2,39 @@ from flask import Blueprint, jsonify, request
 from flask_jwt_extended import (
     create_access_token,
     create_refresh_token,
+    get_jwt,
     get_jwt_identity,
     jwt_required,
 )
 
-from extensions import db
-from models import User
+from app.application.exceptions import (
+    AuthenticationError,
+    ConflictError,
+    NotFoundError,
+    ValidationError,
+)
+from app.application.use_cases.auth_use_cases import (
+    AuthenticateUserUseCase,
+    GetUserUseCase,
+    RegisterUserUseCase,
+)
+from app.infrastructure.repositories.sqlalchemy_user_repository import SqlAlchemyUserRepository
 
-auth = Blueprint("auth", __name__, url_prefix="/api/auth")
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+user_repository = SqlAlchemyUserRepository()
 
 
-@auth.post("/register")
+@auth_bp.post("/register")
 def register():
-    """Register a new user
+    """Register a new account
     ---
     tags:
       - Auth
+    description: >
+      Public self-registration. The very first account created in the
+      system automatically becomes an admin; every account after that is
+      created as a cashier. Admins can create further staff with an
+      explicit role via POST /api/employees.
     parameters:
       - name: body
         in: body
@@ -41,24 +58,17 @@ def register():
         description: Missing fields or username already taken
     """
     data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
-
-    if not username or not password:
-        return jsonify({"error": "'username' and 'password' are required"}), 400
-
-    if User.query.filter_by(username=username).first():
-        return jsonify({"error": "username already taken"}), 400
-
-    user = User(username=username)
-    user.set_password(password)
-    db.session.add(user)
-    db.session.commit()
+    try:
+        user = RegisterUserUseCase(user_repository).execute(
+            data.get("username"), data.get("password")
+        )
+    except (ValidationError, ConflictError) as e:
+        return jsonify({"error": str(e)}), 400
 
     return jsonify(user.to_dict()), 201
 
 
-@auth.post("/login")
+@auth_bp.post("/login")
 def login():
     """Log in and receive JWT access + refresh tokens
     ---
@@ -87,19 +97,20 @@ def login():
         description: Invalid credentials
     """
     data = request.get_json(silent=True) or {}
-    username = data.get("username")
-    password = data.get("password")
+    try:
+        user = AuthenticateUserUseCase(user_repository).execute(
+            data.get("username"), data.get("password")
+        )
+    except AuthenticationError as e:
+        return jsonify({"error": str(e)}), 401
 
-    user = User.query.filter_by(username=username).first()
-    if not user or not user.check_password(password or ""):
-        return jsonify({"error": "invalid username or password"}), 401
-
-    access_token = create_access_token(identity=str(user.id))
-    refresh_token = create_refresh_token(identity=str(user.id))
+    claims = {"role": user.role}
+    access_token = create_access_token(identity=str(user.id), additional_claims=claims)
+    refresh_token = create_refresh_token(identity=str(user.id), additional_claims=claims)
     return jsonify(access_token=access_token, refresh_token=refresh_token)
 
 
-@auth.post("/refresh")
+@auth_bp.post("/refresh")
 @jwt_required(refresh=True)
 def refresh():
     """Exchange a refresh token for a new access token
@@ -115,11 +126,12 @@ def refresh():
         description: Missing or invalid refresh token
     """
     identity = get_jwt_identity()
-    access_token = create_access_token(identity=identity)
+    claims = {"role": get_jwt().get("role")}
+    access_token = create_access_token(identity=identity, additional_claims=claims)
     return jsonify(access_token=access_token)
 
 
-@auth.get("/me")
+@auth_bp.get("/me")
 @jwt_required()
 def me():
     """Get the current logged-in user
@@ -134,24 +146,9 @@ def me():
       401:
         description: Missing or invalid access token
     """
-    user = User.query.get_or_404(int(get_jwt_identity()))
+    try:
+        user = GetUserUseCase(user_repository).execute(int(get_jwt_identity()))
+    except NotFoundError as e:
+        return jsonify({"error": str(e)}), 404
+
     return jsonify(user.to_dict())
-
-
-@auth.get("/users")
-@jwt_required()
-def list_users():
-    """List all registered users
-    ---
-    tags:
-      - Auth
-    security:
-      - Bearer: []
-    responses:
-      200:
-        description: A list of users
-      401:
-        description: Missing or invalid access token
-    """
-    users = User.query.order_by(User.id).all()
-    return jsonify([user.to_dict() for user in users])
